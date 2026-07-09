@@ -1,0 +1,114 @@
+//
+//  BlastRadius.swift
+//  SwiftBlastRadius
+//
+//  "What's the ripple of this change?" — for each symbol touched by a diff, find
+//  its callers and covering tests across a project. Deterministic whole-word
+//  search (same spirit as Find Usages). The human does the reasoning.
+//
+//  Created by David Sherlock on 7/9/26.
+//
+
+import Foundation
+
+/// Finds the project-wide impact of the symbols touched by a change.
+///
+/// The symbol-resolution step (mapping changed lines to their enclosing symbol
+/// names) is injected via a closure, so this stays language- and parser-agnostic —
+/// wire it to tree-sitter breadcrumbs, ctags, an LSP, or anything else.
+public enum BlastRadius {
+
+    /// Directory names skipped while walking the project.
+    public static let skip: Set<String> = [
+        ".git", ".svn", ".hg", "node_modules", ".build", ".swiftpm", "Pods",
+        "DerivedData", "dist", "build", "__pycache__", ".next", ".cache", "vendor",
+    ]
+
+    /// Source file extensions searched for usages.
+    public static let exts: Set<String> = [
+        "swift", "ts", "tsx", "js", "jsx", "mjs", "py", "rb", "php", "go", "rs",
+        "java", "c", "cpp", "cc", "h", "hpp", "cs", "kt", "dart", "lua", "scala",
+    ]
+
+    /// Analyzes the impact of the changed lines in `file`. Call off the main thread —
+    /// it walks the whole project.
+    ///
+    /// - Parameters:
+    ///   - file: The changed file.
+    ///   - root: The project root to search.
+    ///   - changedLines: 1-based line numbers that changed in `file`.
+    ///   - enclosingSymbol: Given a character offset into the file text and that
+    ///     text, returns the breadcrumb trail of enclosing symbols; the **last**
+    ///     element is the innermost symbol. (Wire this to your symbol source.)
+    /// - Returns: One ``SymbolImpact`` per changed symbol that has any usages.
+    public static func analyze(file: URL, root: URL, changedLines: Set<Int>,
+                               enclosingSymbol: (_ charOffset: Int, _ text: String) -> [String]) -> [SymbolImpact] {
+        guard let content = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+        let symbols = changedSymbols(content: content, changedLines: changedLines, enclosingSymbol: enclosingSymbol)
+        guard !symbols.isEmpty else { return [] }
+        let files = sourceFiles(root)
+        return symbols.compactMap { name -> SymbolImpact? in
+            let (callers, tests) = usages(of: name, in: files, root: root)
+            guard !callers.isEmpty || !tests.isEmpty else { return nil }
+            return SymbolImpact(symbol: name, callers: callers, tests: tests)
+        }
+    }
+
+    /// Distinct innermost enclosing symbols of the changed lines.
+    private static func changedSymbols(content: String, changedLines: Set<Int>,
+                                       enclosingSymbol: (Int, String) -> [String]) -> [String] {
+        let ns = content as NSString
+        var seen: [String] = []
+        for line in changedLines.sorted() {
+            let crumbs = enclosingSymbol(charOffset(line, ns), content)
+            if let name = crumbs.last, name.count > 1, !seen.contains(name) { seen.append(name) }
+        }
+        return seen
+    }
+
+    private static func charOffset(_ line: Int, _ ns: NSString) -> Int {
+        var cur = 1, idx = 0
+        while cur < line, idx < ns.length {
+            idx = NSMaxRange(ns.lineRange(for: NSRange(location: idx, length: 0)))
+            cur += 1
+        }
+        return min(idx, ns.length)
+    }
+
+    private static func usages(of name: String, in files: [URL], root: URL) -> ([BlastLocation], [BlastLocation]) {
+        guard let re = try? NSRegularExpression(pattern: "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b") else { return ([], []) }
+        var callers: [BlastLocation] = [], tests: [BlastLocation] = []
+        for f in files {
+            guard let content = try? String(contentsOf: f, encoding: .utf8), content.utf8.count < 500_000 else { continue }
+            let isTest = isTestFile(f)
+            for (i, line) in content.components(separatedBy: "\n").enumerated() {
+                let r = NSRange(location: 0, length: (line as NSString).length)
+                guard re.firstMatch(in: line, range: r) != nil else { continue }
+                let loc = BlastLocation(file: rel(f, root), line: i + 1, text: line.trimmingCharacters(in: .whitespaces), absPath: f.path, isTest: isTest)
+                if isTest { tests.append(loc) } else { callers.append(loc) }
+                if callers.count + tests.count > 300 { return (callers, tests) }
+            }
+        }
+        return (callers, tests)
+    }
+
+    private static func isTestFile(_ f: URL) -> Bool {
+        let p = f.path.lowercased()
+        return p.contains("test") || p.contains("spec") || p.contains("__tests__")
+    }
+
+    private static func sourceFiles(_ root: URL) -> [URL] {
+        var out: [URL] = []
+        guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return [] }
+        for case let url as URL in en {
+            if skip.contains(url.lastPathComponent) { en.skipDescendants(); continue }
+            if exts.contains(url.pathExtension.lowercased()) { out.append(url) }
+            if out.count > 6000 { break }
+        }
+        return out
+    }
+
+    private static func rel(_ url: URL, _ root: URL) -> String {
+        url.path.hasPrefix(root.path) ? String(url.path.dropFirst(root.path.count).drop(while: { $0 == "/" })) : url.lastPathComponent
+    }
+}
