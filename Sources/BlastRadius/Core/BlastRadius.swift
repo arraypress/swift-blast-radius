@@ -66,21 +66,34 @@ public enum BlastRadius {
         return seen
     }
 
+    /// Converts a 1-based git line number to a UTF-16 offset. Counts lines the way
+    /// git does — by `\n` only — never by Unicode separators (U+2028/U+2029/U+0085),
+    /// which `NSString.lineRange` treats as breaks and would skew the offset.
     private static func charOffset(_ line: Int, _ ns: NSString) -> Int {
         var cur = 1, idx = 0
         while cur < line, idx < ns.length {
-            idx = NSMaxRange(ns.lineRange(for: NSRange(location: idx, length: 0)))
-            cur += 1
+            if ns.character(at: idx) == 0x0A { cur += 1 }
+            idx += 1
         }
         return min(idx, ns.length)
     }
 
     private static func usages(of name: String, in files: [URL], root: URL) -> ([BlastLocation], [BlastLocation]) {
-        guard let re = try? NSRegularExpression(pattern: "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b") else { return ([], []) }
+        // `\b` next to a non-word character inverts its meaning (\b==\b never matches
+        // ` a == b `), so only anchor the ends of the name that are word characters —
+        // fully non-word names (operators like `==`) fall back to a literal search.
+        func isWordChar(_ c: Character?) -> Bool {
+            guard let c else { return false }
+            return c == "_" || c.isLetter || c.isNumber
+        }
+        let pattern = (isWordChar(name.first) ? "\\b" : "")
+            + NSRegularExpression.escapedPattern(for: name)
+            + (isWordChar(name.last) ? "\\b" : "")
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return ([], []) }
         var callers: [BlastLocation] = [], tests: [BlastLocation] = []
         for f in files {
             guard let content = try? String(contentsOf: f, encoding: .utf8), content.utf8.count < 500_000 else { continue }
-            let isTest = isTestFile(f)
+            let isTest = isTestFile(f, root: root)
             for (i, line) in content.components(separatedBy: "\n").enumerated() {
                 let r = NSRange(location: 0, length: (line as NSString).length)
                 guard re.firstMatch(in: line, range: r) != nil else { continue }
@@ -92,9 +105,23 @@ public enum BlastRadius {
         return (callers, tests)
     }
 
-    private static func isTestFile(_ f: URL) -> Bool {
-        let p = f.path.lowercased()
-        return p.contains("test") || p.contains("spec") || p.contains("__tests__")
+    /// Classifies from the root-relative path only (so the checkout location can't
+    /// flip it) and matches whole path components / filename word boundaries — never
+    /// raw substrings, which would hit "latest", "InspectorPanel", "PerspectiveView"…
+    private static func isTestFile(_ f: URL, root: URL) -> Bool {
+        let words = ["test", "tests", "spec", "specs"]
+        let dirNames: Set<String> = ["test", "tests", "__tests__", "spec", "specs", "testing"]
+        let parts = rel(f, root).split(separator: "/")
+        for dir in parts.dropLast() where dirNames.contains(dir.lowercased()) { return true }
+        let stem = f.deletingPathExtension().lastPathComponent
+        // CamelCase suffixes (MyTests, FooSpec) — capitalized, so "latest" can't match.
+        if ["Test", "Tests", "Spec", "Specs"].contains(where: { stem.hasSuffix($0) }) { return true }
+        let lower = stem.lowercased()
+        for word in words {
+            if lower == word { return true }
+            for sep in [".", "_", "-"] where lower.hasSuffix(sep + word) || lower.hasPrefix(word + sep) { return true }
+        }
+        return false
     }
 
     private static func sourceFiles(_ root: URL) -> [URL] {
@@ -109,6 +136,9 @@ public enum BlastRadius {
     }
 
     private static func rel(_ url: URL, _ root: URL) -> String {
-        url.path.hasPrefix(root.path) ? String(url.path.dropFirst(root.path.count).drop(while: { $0 == "/" })) : url.lastPathComponent
+        // Resolve symlinks on both sides — the enumerator can yield /private/var/…
+        // for a /var/… root, which would otherwise defeat the prefix check.
+        let u = url.resolvingSymlinksInPath().path, r = root.resolvingSymlinksInPath().path
+        return u.hasPrefix(r) ? String(u.dropFirst(r.count).drop(while: { $0 == "/" })) : url.lastPathComponent
     }
 }

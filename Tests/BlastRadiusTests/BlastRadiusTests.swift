@@ -87,4 +87,69 @@ final class BlastRadiusTests: XCTestCase {
         let impacts = BlastRadius.analyze(file: changed, root: root, changedLines: [2]) { _, _ in ["Outer", "foo"] }
         XCTAssertEqual(impacts.first?.symbol, "foo")
     }
+
+    // MARK: - Regressions
+
+    /// Regression: test-file classification must not substring-match "test"/"spec"
+    /// inside unrelated words ("InspectorPanel", "PerspectiveView") or in path
+    /// components above the project root (a checkout under ~/latest/…).
+    func testTestFileClassificationIgnoresSubstringsAndCheckoutPath() throws {
+        // Root path deliberately contains "test" and "spec" as substrings.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("latest-contest-perspective-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        scratch.append(root)
+        func write(_ rel: String, _ body: String) throws {
+            let url = root.appendingPathComponent(rel)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try body.write(to: url, atomically: true, encoding: .utf8)
+        }
+        try write("changed.swift", "func foo() {\n    return\n}\n")
+        try write("InspectorPanel.swift", "foo()\n")       // "spec" substring — NOT a test
+        try write("PerspectiveView.swift", "foo()\n")      // "spec" substring — NOT a test
+        try write("caller.swift", "foo()\n")
+        try write("MyTests.swift", "foo()\n")              // *Tests.swift — a test
+        try write("tests/helpers.swift", "foo()\n")        // tests/ dir — a test
+        try write("test_foo.py", "foo()\n")                // pytest naming — a test
+
+        let changed = root.appendingPathComponent("changed.swift")
+        let impacts = BlastRadius.analyze(file: changed, root: root, changedLines: [2]) { _, _ in ["foo"] }
+        let impact = try XCTUnwrap(impacts.first)
+        for file in ["InspectorPanel.swift", "PerspectiveView.swift", "caller.swift"] {
+            XCTAssertTrue(impact.callers.contains { $0.file == file }, "\(file) should be a caller")
+            XCTAssertFalse(impact.tests.contains { $0.file == file }, "\(file) must not be a test")
+        }
+        for file in ["MyTests.swift", "tests/helpers.swift", "test_foo.py"] {
+            XCTAssertTrue(impact.tests.contains { $0.file == file }, "\(file) should be a test")
+        }
+    }
+
+    /// Regression: a fully non-word symbol (an operator like `==`) must still find
+    /// idiomatic spaced call sites — `\b==\b` never matches ` a == b `.
+    func testOperatorSymbolFindsSpacedUsages() throws {
+        let root = try makeProject()
+        let url = root.appendingPathComponent("ops.swift")
+        try "func check(a: Int, b: Int) -> Bool {\n    return a == b\n}\n".write(to: url, atomically: true, encoding: .utf8)
+        let impacts = BlastRadius.analyze(file: url, root: root, changedLines: [2]) { _, _ in ["=="] }
+        let impact = try XCTUnwrap(impacts.first)
+        XCTAssertEqual(impact.symbol, "==")
+        XCTAssertTrue(impact.callers.contains { $0.file == "ops.swift" && $0.line == 2 })
+    }
+
+    /// Regression: changed line numbers are git line numbers (`\n`-counted), so a
+    /// mid-line U+2028 must not shift the offset handed to the symbol resolver.
+    func testCharOffsetCountsNewlinesOnlyNotUnicodeSeparators() throws {
+        let root = try makeProject()
+        let url = root.appendingPathComponent("sep.js")
+        let content = "line1\u{2028}still\nline2\nfoo()\n"
+        try content.write(to: url, atomically: true, encoding: .utf8)
+        var captured: Int?
+        _ = BlastRadius.analyze(file: url, root: root, changedLines: [3]) { offset, _ in
+            captured = offset
+            return ["foo"]
+        }
+        let offset = try XCTUnwrap(captured)
+        XCTAssertTrue((content as NSString).substring(from: offset).hasPrefix("foo()"),
+                      "git line 3 should resolve to the start of the third \\n-line, got offset \(offset)")
+    }
 }
