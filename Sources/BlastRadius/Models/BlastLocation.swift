@@ -27,6 +27,7 @@ public struct BlastLocation: Sendable, Equatable {
     /// Whether this reference lives in a test file.
     public let isTest: Bool
 
+    /// Creates a location.
     public init(file: String, line: Int, text: String, absPath: String, isTest: Bool) {
         self.file = file
         self.line = line

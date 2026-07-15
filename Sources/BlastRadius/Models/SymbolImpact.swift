@@ -21,6 +21,7 @@ public struct SymbolImpact: Sendable, Equatable {
     /// References in test files.
     public let tests: [BlastLocation]
 
+    /// Creates an impact record.
     public init(symbol: String, callers: [BlastLocation], tests: [BlastLocation]) {
         self.symbol = symbol
         self.callers = callers

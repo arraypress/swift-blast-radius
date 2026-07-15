@@ -30,8 +30,7 @@ public enum BlastRadius {
         "java", "c", "cpp", "cc", "h", "hpp", "cs", "kt", "dart", "lua", "scala",
     ]
 
-    /// Analyzes the impact of the changed lines in `file`. Call off the main thread —
-    /// it walks the whole project.
+    /// Analyzes the impact of the changed lines in `file`.
     ///
     /// - Parameters:
     ///   - file: The changed file.
@@ -41,6 +40,8 @@ public enum BlastRadius {
     ///     text, returns the breadcrumb trail of enclosing symbols; the **last**
     ///     element is the innermost symbol. (Wire this to your symbol source.)
     /// - Returns: One ``SymbolImpact`` per changed symbol that has any usages.
+    /// - Note: Blocking — reads `file` and walks/reads the whole project tree
+    ///   synchronously. Call off the main thread.
     public static func analyze(file: URL, root: URL, changedLines: Set<Int>,
                                enclosingSymbol: (_ charOffset: Int, _ text: String) -> [String]) -> [SymbolImpact] {
         guard let content = try? String(contentsOf: file, encoding: .utf8) else { return [] }
@@ -78,6 +79,8 @@ public enum BlastRadius {
         return min(idx, ns.length)
     }
 
+    /// Whole-word searches `files` for `name`, splitting hits into (callers, tests).
+    /// Skips files ≥ 500 KB and stops past 300 total hits.
     private static func usages(of name: String, in files: [URL], root: URL) -> ([BlastLocation], [BlastLocation]) {
         // `\b` next to a non-word character inverts its meaning (\b==\b never matches
         // ` a == b `), so only anchor the ends of the name that are word characters —
@@ -124,6 +127,8 @@ public enum BlastRadius {
         return false
     }
 
+    /// Walks `root` for source files (by ``exts``), pruning ``skip`` directories
+    /// and capping the walk at 6000 files.
     private static func sourceFiles(_ root: URL) -> [URL] {
         var out: [URL] = []
         guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return [] }
@@ -135,6 +140,7 @@ public enum BlastRadius {
         return out
     }
 
+    /// Root-relative path of `url`, or just its filename if it's outside `root`.
     private static func rel(_ url: URL, _ root: URL) -> String {
         // Resolve symlinks on both sides — the enumerator can yield /private/var/…
         // for a /var/… root, which would otherwise defeat the prefix check.
