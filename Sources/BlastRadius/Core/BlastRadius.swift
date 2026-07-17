@@ -18,11 +18,19 @@ import Foundation
 /// wire it to tree-sitter breadcrumbs, ctags, an LSP, or anything else.
 public enum BlastRadius {
 
-    /// Directory names skipped while walking the project.
-    public static let skip: Set<String> = [
+    /// The built-in noise list skipped while walking the project.
+    public static let defaultSkip: Set<String> = [
         ".git", ".svn", ".hg", "node_modules", ".build", ".swiftpm", "Pods",
         "DerivedData", "dist", "build", "__pycache__", ".next", ".cache", "vendor",
     ]
+
+    /// Directory names skipped while walking the project. Defaults to
+    /// ``defaultSkip``; assign to override (e.g. from a user preference — a
+    /// project with real sources in `dist/` needs it off the list).
+    ///
+    /// - Important: Global mutable state read by every ``analyze(file:root:changedLines:enclosingSymbol:)``
+    ///   walk. Set it during start-up, not concurrently with an analysis.
+    public static var skip: Set<String> = defaultSkip
 
     /// Source file extensions searched for usages.
     public static let exts: Set<String> = [
@@ -53,6 +61,26 @@ public enum BlastRadius {
             guard !callers.isEmpty || !tests.isEmpty else { return nil }
             return SymbolImpact(symbol: name, callers: callers, tests: tests)
         }
+    }
+
+    /// Project-wide references to a single named symbol — the "Find References"
+    /// entry point (``analyze(file:root:changedLines:enclosingSymbol:)`` is the
+    /// diff-driven one). Same deterministic whole-word search, so it is honest
+    /// about being NAME-based, not semantic: it finds every whole-word `name`
+    /// (a same-named field, a mention in a string) and can't tell two same-named
+    /// methods on different types apart. That's the right tradeoff for a
+    /// language-agnostic review tool with no language server — but callers should
+    /// present it as "References", not a compiler-accurate call hierarchy.
+    ///
+    /// - Returns: A ``SymbolImpact`` (callers + covering tests), or nil when the
+    ///   symbol has no whole-word hits anywhere in the project.
+    /// - Note: Blocking — walks and reads the project tree synchronously. Call
+    ///   off the main thread.
+    public static func references(to name: String, root: URL) -> SymbolImpact? {
+        guard name.count > 1 else { return nil }
+        let (callers, tests) = usages(of: name, in: sourceFiles(root), root: root)
+        guard !callers.isEmpty || !tests.isEmpty else { return nil }
+        return SymbolImpact(symbol: name, callers: callers, tests: tests)
     }
 
     /// Distinct innermost enclosing symbols of the changed lines.

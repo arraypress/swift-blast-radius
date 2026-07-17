@@ -152,4 +152,27 @@ final class BlastRadiusTests: XCTestCase {
         XCTAssertTrue((content as NSString).substring(from: offset).hasPrefix("foo()"),
                       "git line 3 should resolve to the start of the third \\n-line, got offset \(offset)")
     }
+
+    // MARK: - references(to:root:)
+
+    func testReferencesFindsCallersAndTestsByName() throws {
+        let root = try makeProject()
+        let impact = try XCTUnwrap(BlastRadius.references(to: "foo", root: root))
+        XCTAssertEqual(impact.symbol, "foo")
+        // Every non-test whole-word hit is a caller; node_modules is skipped.
+        XCTAssertTrue(impact.callers.contains { $0.file == "caller.swift" })
+        XCTAssertTrue(impact.callers.allSatisfy { $0.file != "node_modules/pkg.js" })
+        XCTAssertTrue(impact.tests.contains { $0.file == "MyTests.swift" })
+    }
+
+    func testReferencesToUnknownSymbolIsNil() throws {
+        let root = try makeProject()
+        XCTAssertNil(BlastRadius.references(to: "nonexistent", root: root))
+    }
+
+    func testReferencesRejectsOneCharacterNames() throws {
+        let root = try makeProject()
+        // count > 1 guard: a single char would match far too much to be useful.
+        XCTAssertNil(BlastRadius.references(to: "x", root: root))
+    }
 }
