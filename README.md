@@ -23,7 +23,7 @@
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/arraypress/swift-blast-radius.git", from: "1.0.0")
+    .package(url: "https://github.com/Sidewatch/swift-blast-radius.git", from: "1.0.0")
 ]
 ```
 
