@@ -52,15 +52,42 @@ public enum BlastRadius {
     ///   synchronously. Call off the main thread.
     public static func analyze(file: URL, root: URL, changedLines: Set<Int>,
                                enclosingSymbol: (_ charOffset: Int, _ text: String) -> [String]) -> [SymbolImpact] {
-        guard let content = try? String(contentsOf: file, encoding: .utf8) else { return [] }
-        let symbols = changedSymbols(content: content, changedLines: changedLines, enclosingSymbol: enclosingSymbol)
-        guard !symbols.isEmpty else { return [] }
-        let files = sourceFiles(root)
-        return symbols.compactMap { name -> SymbolImpact? in
-            let (callers, tests) = usages(of: name, in: files, root: root)
-            guard !callers.isEmpty || !tests.isEmpty else { return nil }
-            return SymbolImpact(symbol: name, callers: callers, tests: tests)
+        analyze(files: [(file, changedLines)], root: root, enclosingSymbol: enclosingSymbol)[file] ?? []
+    }
+
+    /// Batch form of ``analyze(file:root:changedLines:enclosingSymbol:)`` for a
+    /// whole changeset: the project tree is walked ONCE and every project file is
+    /// read and line-split ONCE, with all changed symbols matched in that single
+    /// pass — per-file calls re-pay the full walk + read per symbol, which is
+    /// what made a many-file Change Impact Map take minutes.
+    ///
+    /// - Parameter files: The changed files with their 1-based changed lines.
+    /// - Returns: Each input file's impacts (same contents and order as the
+    ///   per-file call would produce), keyed by file. Unreadable files get `[]`.
+    /// - Note: Blocking — reads every listed file and walks/reads the whole
+    ///   project tree synchronously. Call off the main thread.
+    public static func analyze(files: [(file: URL, changedLines: Set<Int>)], root: URL,
+                               enclosingSymbol: (_ charOffset: Int, _ text: String) -> [String]) -> [URL: [SymbolImpact]] {
+        var perFileSymbols: [(URL, [String])] = []
+        var allSymbols: [String] = []   // ordered, deduped across files
+        for (file, changedLines) in files {
+            guard let content = try? String(contentsOf: file, encoding: .utf8) else {
+                perFileSymbols.append((file, []))
+                continue
+            }
+            let symbols = changedSymbols(content: content, changedLines: changedLines, enclosingSymbol: enclosingSymbol)
+            perFileSymbols.append((file, symbols))
+            for name in symbols where !allSymbols.contains(name) { allSymbols.append(name) }
         }
+        let hits = allSymbols.isEmpty ? [:] : usages(of: allSymbols, in: sourceFiles(root), root: root)
+        var out: [URL: [SymbolImpact]] = [:]
+        for (file, symbols) in perFileSymbols {
+            out[file] = symbols.compactMap { name -> SymbolImpact? in
+                guard let (callers, tests) = hits[name], !callers.isEmpty || !tests.isEmpty else { return nil }
+                return SymbolImpact(symbol: name, callers: callers, tests: tests)
+            }
+        }
+        return out
     }
 
     /// Project-wide references to a single named symbol — the "Find References"
@@ -110,6 +137,24 @@ public enum BlastRadius {
     /// Whole-word searches `files` for `name`, splitting hits into (callers, tests).
     /// Skips files ≥ 500 KB and stops past 300 total hits.
     private static func usages(of name: String, in files: [URL], root: URL) -> ([BlastLocation], [BlastLocation]) {
+        usages(of: [name], in: files, root: root)[name] ?? ([], [])
+    }
+
+    /// One search slot per symbol: its precompiled regex, the hits so far, and
+    /// whether its per-symbol 300-hit cap has been reached.
+    private struct SymbolSlot {
+        let name: String
+        let regex: NSRegularExpression
+        var callers: [BlastLocation] = []
+        var tests: [BlastLocation] = []
+        var capped = false
+    }
+
+    /// Whole-word searches `files` for every symbol in `names` in a SINGLE pass —
+    /// each file is read and line-split once, and every symbol's regex runs
+    /// against each already-split line. Skips files ≥ 500 KB; each symbol keeps
+    /// its own past-300-hits stop (matching the per-symbol search exactly).
+    private static func usages(of names: [String], in files: [URL], root: URL) -> [String: ([BlastLocation], [BlastLocation])] {
         // `\b` next to a non-word character inverts its meaning (\b==\b never matches
         // ` a == b `), so only anchor the ends of the name that are word characters —
         // fully non-word names (operators like `==`) fall back to a literal search.
@@ -117,23 +162,34 @@ public enum BlastRadius {
             guard let c else { return false }
             return c == "_" || c.isLetter || c.isNumber
         }
-        let pattern = (isWordChar(name.first) ? "\\b" : "")
-            + NSRegularExpression.escapedPattern(for: name)
-            + (isWordChar(name.last) ? "\\b" : "")
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return ([], []) }
-        var callers: [BlastLocation] = [], tests: [BlastLocation] = []
-        for f in files {
+        var slots: [SymbolSlot] = names.compactMap { name in
+            let pattern = (isWordChar(name.first) ? "\\b" : "")
+                + NSRegularExpression.escapedPattern(for: name)
+                + (isWordChar(name.last) ? "\\b" : "")
+            guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+            return SymbolSlot(name: name, regex: re)
+        }
+        fileLoop: for f in files {
             guard let content = try? String(contentsOf: f, encoding: .utf8), content.utf8.count < 500_000 else { continue }
             let isTest = isTestFile(f, root: root)
+            let relPath = rel(f, root)
             for (i, line) in content.components(separatedBy: "\n").enumerated() {
                 let r = NSRange(location: 0, length: (line as NSString).length)
-                guard re.firstMatch(in: line, range: r) != nil else { continue }
-                let loc = BlastLocation(file: rel(f, root), line: i + 1, text: line.trimmingCharacters(in: .whitespaces), absPath: f.path, isTest: isTest)
-                if isTest { tests.append(loc) } else { callers.append(loc) }
-                if callers.count + tests.count > 300 { return (callers, tests) }
+                var allCapped = true
+                for s in slots.indices {
+                    guard !slots[s].capped else { continue }
+                    allCapped = false
+                    guard slots[s].regex.firstMatch(in: line, range: r) != nil else { continue }
+                    let loc = BlastLocation(file: relPath, line: i + 1, text: line.trimmingCharacters(in: .whitespaces), absPath: f.path, isTest: isTest)
+                    if isTest { slots[s].tests.append(loc) } else { slots[s].callers.append(loc) }
+                    if slots[s].callers.count + slots[s].tests.count > 300 { slots[s].capped = true }
+                }
+                if allCapped { break fileLoop }
             }
         }
-        return (callers, tests)
+        var out: [String: ([BlastLocation], [BlastLocation])] = [:]
+        for slot in slots { out[slot.name] = (slot.callers, slot.tests) }
+        return out
     }
 
     /// Classifies from the root-relative path only (so the checkout location can't

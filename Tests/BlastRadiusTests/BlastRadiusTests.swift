@@ -153,6 +153,53 @@ final class BlastRadiusTests: XCTestCase {
                       "git line 3 should resolve to the start of the third \\n-line, got offset \(offset)")
     }
 
+    /// Regression: the batch analyze (one tree walk + one read pass for the whole
+    /// changeset) must produce exactly what per-file calls do — including a line
+    /// that mentions SEVERAL changed symbols, which must bucket under each of them.
+    func testBatchAnalyzeMatchesPerFileCallsAndBucketsSharedLines() throws {
+        let root = try makeProject()
+        func write(_ rel: String, _ body: String) throws {
+            try body.write(to: root.appendingPathComponent(rel), atomically: true, encoding: .utf8)
+        }
+        try write("defsA.swift", "func alpha() {}\n")
+        try write("defsB.swift", "func beta() {}\n")
+        try write("both.swift", "alpha(); beta()\n")
+        let resolver: (Int, String) -> [String] = { _, text in
+            if text.contains("func alpha") { return ["alpha"] }
+            if text.contains("func beta") { return ["beta"] }
+            return []
+        }
+        let a = root.appendingPathComponent("defsA.swift")
+        let b = root.appendingPathComponent("defsB.swift")
+
+        let batch = BlastRadius.analyze(files: [(a, [1]), (b, [1])], root: root, enclosingSymbol: resolver)
+        for file in [a, b] {
+            XCTAssertEqual(batch[file],
+                           BlastRadius.analyze(file: file, root: root, changedLines: [1], enclosingSymbol: resolver),
+                           file.lastPathComponent)
+        }
+        // The line mentioning both symbols must appear under BOTH, not just one.
+        XCTAssertTrue(batch[a]?.first?.callers.contains { $0.file == "both.swift" && $0.line == 1 } ?? false)
+        XCTAssertTrue(batch[b]?.first?.callers.contains { $0.file == "both.swift" && $0.line == 1 } ?? false)
+    }
+
+    /// Regression: operator symbols keep their literal (un-anchored) matching in
+    /// the batched single-pass search alongside word symbols.
+    func testBatchAnalyzeKeepsOperatorMatching() throws {
+        let root = try makeProject()
+        let ops = root.appendingPathComponent("ops.swift")
+        try "func check(a: Int, b: Int) -> Bool {\n    return a == b\n}\n".write(to: ops, atomically: true, encoding: .utf8)
+        let changed = root.appendingPathComponent("changed.swift")
+        let resolver: (Int, String) -> [String] = { _, text in
+            text.contains("func check") ? ["=="] : ["foo"]
+        }
+        let batch = BlastRadius.analyze(files: [(changed, [2]), (ops, [2])], root: root, enclosingSymbol: resolver)
+        XCTAssertEqual(batch[changed]?.first?.symbol, "foo")
+        let opImpact = try XCTUnwrap(batch[ops]?.first)
+        XCTAssertEqual(opImpact.symbol, "==")
+        XCTAssertTrue(opImpact.callers.contains { $0.file == "ops.swift" && $0.line == 2 })
+    }
+
     // MARK: - references(to:root:)
 
     func testReferencesFindsCallersAndTestsByName() throws {
